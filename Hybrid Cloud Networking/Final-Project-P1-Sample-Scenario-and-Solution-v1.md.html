@@ -1,0 +1,10 @@
+<script>
+  const base_url = "https://author-ide.skills.network/render?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJtZF9pbnN0cnVjdGlvbnNfdXJsIjoiaHR0cHM6Ly9jZi1jb3Vyc2VzLWRhdGEuczMudXMuY2xvdWQtb2JqZWN0LXN0b3JhZ2UuYXBwZG9tYWluLmNsb3VkLzI2WnFPaUVDTVZtdXQ3cFFTX2FuaWcvRmluYWwtUHJvamVjdC1QMS1TYW1wbGUtU2NlbmFyaW8tYW5kLVNvbHV0aW9uLXYxLm1kP3Q9MTc2Nzc1ODY1MyIsInRvb2xfdHlwZSI6Imluc3RydWN0aW9uYWwtbGFiIiwiYXRsYXNfZmlsZV9pZCI6NDU0MTE4LCJhZG1pbiI6ZmFsc2UsImlhdCI6MTc2Nzc1ODY1M30.9cp4ON90T54hk2cshuRaMNTX13o9gAwgp-ePEInJITs";
+  const currentUrl = new URL(window.location.href);
+  const targetUrl = new URL(base_url);
+  const langParam = currentUrl.searchParams.get('lang');
+  if (langParam) {
+    targetUrl.searchParams.set('lang', langParam);
+  }
+  window.location.href = targetUrl.toString();
+</script>
