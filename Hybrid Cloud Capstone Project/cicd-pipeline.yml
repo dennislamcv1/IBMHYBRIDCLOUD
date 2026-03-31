@@ -1,0 +1,575 @@
+# =============================================================================
+# CI/CD Pipeline — Global Retail Platform: Product Microservice
+# IBM Cloud Toolchain / Tekton Pipeline
+# Target environments: Development → Staging → Production (IBM Cloud Kubernetes)
+# =============================================================================
+
+version: "1.0"
+
+# ---------------------------------------------------------------------------
+# Pipeline triggers
+# ---------------------------------------------------------------------------
+triggers:
+  - type: git
+    name: push-to-main
+    event: push
+    branch: main
+    enabled: true
+
+  - type: git
+    name: pull-request
+    event: pull_request
+    branch: main
+    enabled: true
+
+  - type: manual
+    name: manual-trigger
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Environment variables (non-secret)
+# ---------------------------------------------------------------------------
+env:
+  IMAGE_NAME:         "product-microservice"
+  IMAGE_TAG:          "${GIT_COMMIT_SHORT}"          # e.g. a3f9c12
+  IMAGE_VERSION:      "v1.0.0"
+  REGISTRY_REGION:    "us-south"
+  REGISTRY_NAMESPACE: "global-retail-platform"
+  ICR_HOST:           "us.icr.io"
+  IKS_CLUSTER_DEV:    "retail-dev-cluster"
+  IKS_CLUSTER_STG:    "retail-staging-cluster"
+  IKS_CLUSTER_PROD:   "retail-prod-cluster"
+  NAMESPACE_DEV:      "retail-dev"
+  NAMESPACE_STG:      "retail-staging"
+  NAMESPACE_PROD:     "retail-production"
+  PYTHON_VERSION:     "3.12"
+
+# ---------------------------------------------------------------------------
+# Secrets (resolved from IBM Secrets Manager at runtime)
+# ---------------------------------------------------------------------------
+secrets:
+  - name: IBM_API_KEY
+    source: secrets-manager
+    key:    ibm-api-key
+  - name: ICR_API_KEY
+    source: secrets-manager
+    key:    icr-push-api-key
+  - name: SONARQUBE_TOKEN
+    source: secrets-manager
+    key:    sonarqube-token
+
+# =============================================================================
+# STAGE 1 — BUILD
+# Compiles the application, builds the Docker image, and tags it with both
+# the short Git commit SHA (for traceability) and a semantic version label.
+# =============================================================================
+stages:
+  - name: build
+    display_name: "Stage 1: Build"
+    image: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.17"
+    steps:
+
+      - name: set-build-metadata
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          export GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+          export BUILD_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          export FULL_IMAGE_TAG="${ICR_HOST}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}-${GIT_COMMIT_SHORT}"
+          echo "GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}"   >> build.env
+          echo "BUILD_TIMESTAMP=${BUILD_TIMESTAMP}"     >> build.env
+          echo "FULL_IMAGE_TAG=${FULL_IMAGE_TAG}"       >> build.env
+          echo "[BUILD] Image will be tagged: ${FULL_IMAGE_TAG}"
+
+      - name: ibmcloud-login
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          ibmcloud login --apikey "${IBM_API_KEY}" -r "${REGISTRY_REGION}" -g Default
+          ibmcloud cr login
+          ibmcloud cr namespace-list | grep "${REGISTRY_NAMESPACE}" \
+            || ibmcloud cr namespace-add "${REGISTRY_NAMESPACE}"
+          echo "[BUILD] IBM Cloud Container Registry login successful"
+
+      - name: docker-build-and-push
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          source build.env
+
+          echo "[BUILD] Building Docker image..."
+          docker build \
+            --label "build.timestamp=${BUILD_TIMESTAMP}" \
+            --label "build.commit=${GIT_COMMIT_SHORT}" \
+            --label "build.version=${IMAGE_VERSION}" \
+            -t "${FULL_IMAGE_TAG}" \
+            -f Dockerfile .
+
+          # Also tag with 'latest' for convenience
+          docker tag "${FULL_IMAGE_TAG}" \
+            "${ICR_HOST}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:latest"
+
+          echo "[BUILD] Pushing image to IBM Container Registry..."
+          docker push "${FULL_IMAGE_TAG}"
+          docker push "${ICR_HOST}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:latest"
+
+          echo "[BUILD] Image pushed successfully: ${FULL_IMAGE_TAG}"
+
+    # Simulated output log
+    # -------------------------------------------------------------------
+    # [BUILD] Image will be tagged: us.icr.io/global-retail-platform/product-microservice:v1.0.0-a3f9c12
+    # [BUILD] IBM Cloud Container Registry login successful
+    # [BUILD] Building Docker image...
+    # Step 1/8 : FROM python:3.12-slim
+    # Step 2/8 : WORKDIR /app
+    # Step 3/8 : COPY requirements.txt .
+    # Step 4/8 : RUN pip install --no-cache-dir -r requirements.txt
+    # Step 5/8 : COPY . .
+    # Step 6/8 : EXPOSE 8000
+    # Step 7/8 : CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    # Successfully built d84f3c1a9b02
+    # Successfully tagged us.icr.io/global-retail-platform/product-microservice:v1.0.0-a3f9c12
+    # [BUILD] Pushing image to IBM Container Registry...
+    # [BUILD] Image pushed successfully
+    # STAGE RESULT: PASSED
+    # -------------------------------------------------------------------
+
+    artifacts:
+      - name: docker-image
+        type: image
+        value: "${FULL_IMAGE_TAG}"
+      - name: build-env
+        type: file
+        path: build.env
+
+# =============================================================================
+# STAGE 2 — TEST
+# Executes unit and integration tests against the application source.
+# A non-zero exit code from pytest fails the stage and blocks promotion.
+# =============================================================================
+  - name: test
+    display_name: "Stage 2: Test"
+    depends_on: [build]
+    image: "python:3.12-slim"
+    steps:
+
+      - name: install-dependencies
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir pytest pytest-cov httpx
+          echo "[TEST] Dependencies installed"
+
+      - name: run-unit-tests
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          echo "[TEST] Running unit tests..."
+          pytest tests/unit/ \
+            --tb=short \
+            --junitxml=test-results/unit-results.xml \
+            -v
+          echo "[TEST] Unit tests passed"
+
+      - name: run-integration-tests
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          echo "[TEST] Running integration tests..."
+          pytest tests/integration/ \
+            --tb=short \
+            --junitxml=test-results/integration-results.xml \
+            --cov=app \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=80 \
+            -v
+          echo "[TEST] Integration tests passed. Coverage threshold met."
+
+    # Simulated output log
+    # -------------------------------------------------------------------
+    # [TEST] Dependencies installed
+    # [TEST] Running unit tests...
+    # tests/unit/test_products.py::test_create_product PASSED
+    # tests/unit/test_products.py::test_get_all_products PASSED
+    # tests/unit/test_products.py::test_get_product_by_id PASSED
+    # tests/unit/test_products.py::test_update_product PASSED
+    # tests/unit/test_products.py::test_delete_product PASSED
+    # tests/unit/test_products.py::test_missing_required_fields_returns_400 PASSED
+    # tests/unit/test_products.py::test_product_not_found_returns_404 PASSED
+    # ======= 7 passed in 1.23s =======
+    # [TEST] Running integration tests...
+    # tests/integration/test_api_routes.py::test_full_crud_lifecycle PASSED
+    # tests/integration/test_api_routes.py::test_partial_update_merges_fields PASSED
+    # ======= 2 passed in 0.87s =======
+    # Coverage: 91% (threshold: 80%) — OK
+    # STAGE RESULT: PASSED
+    # -------------------------------------------------------------------
+
+    artifacts:
+      - name: unit-test-results
+        type: junit
+        path: test-results/unit-results.xml
+      - name: integration-test-results
+        type: junit
+        path: test-results/integration-results.xml
+      - name: coverage-report
+        type: file
+        path: coverage.xml
+
+# =============================================================================
+# STAGE 3 — SECURITY VALIDATION
+# Runs three independent scans. Any high-severity finding fails the stage
+# and prevents the image from being promoted to any environment.
+# =============================================================================
+  - name: security
+    display_name: "Stage 3: Security Validation"
+    depends_on: [test]
+    image: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.17"
+    steps:
+
+      - name: dependency-vulnerability-scan
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          pip install --no-cache-dir safety
+          echo "[SECURITY] Scanning Python dependencies with Safety..."
+          safety check \
+            --full-report \
+            --output json \
+            > safety-report.json
+          # Fail if any HIGH or CRITICAL vulnerabilities found
+          HIGH_COUNT=$(python3 -c "
+          import json, sys
+          data = json.load(open('safety-report.json'))
+          high = [v for v in data.get('vulnerabilities', []) if v.get('severity','').upper() in ('HIGH','CRITICAL')]
+          print(len(high))
+          ")
+          if [ "${HIGH_COUNT}" -gt 0 ]; then
+            echo "[SECURITY] FAILED: ${HIGH_COUNT} high/critical dependency vulnerabilities detected"
+            exit 1
+          fi
+          echo "[SECURITY] Dependency scan passed — 0 high/critical vulnerabilities"
+
+      - name: container-image-scan
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          source build.env
+          echo "[SECURITY] Scanning container image with IBM Vulnerability Advisor..."
+          ibmcloud login --apikey "${IBM_API_KEY}" -r "${REGISTRY_REGION}"
+          ibmcloud cr va "${FULL_IMAGE_TAG}" --output json > va-report.json
+          ISSUES=$(python3 -c "
+          import json
+          data = json.load(open('va-report.json'))
+          critical = [i for i in data.get('issues', []) if i.get('severity') in ('High','Critical')]
+          print(len(critical))
+          ")
+          if [ "${ISSUES}" -gt 0 ]; then
+            echo "[SECURITY] FAILED: IBM VA detected ${ISSUES} critical image issues"
+            exit 1
+          fi
+          echo "[SECURITY] Container image scan passed — no critical issues"
+
+      - name: static-code-analysis
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          echo "[SECURITY] Running static analysis with SonarQube..."
+          sonar-scanner \
+            -Dsonar.projectKey=product-microservice \
+            -Dsonar.sources=. \
+            -Dsonar.host.url="${SONARQUBE_HOST}" \
+            -Dsonar.login="${SONARQUBE_TOKEN}" \
+            -Dsonar.python.coverage.reportPaths=coverage.xml \
+            -Dsonar.qualitygate.wait=true
+          echo "[SECURITY] Static analysis passed — Quality Gate: OK"
+
+    # Simulated output log
+    # -------------------------------------------------------------------
+    # [SECURITY] Scanning Python dependencies with Safety...
+    # Scanned 18 packages. 0 vulnerabilities found.
+    # [SECURITY] Dependency scan passed — 0 high/critical vulnerabilities
+    # [SECURITY] Scanning container image with IBM Vulnerability Advisor...
+    # Image: us.icr.io/global-retail-platform/product-microservice:v1.0.0-a3f9c12
+    # Vulnerabilities found: 0 Critical, 0 High, 2 Low (Low issues do not block pipeline)
+    # [SECURITY] Container image scan passed — no critical issues
+    # [SECURITY] Running static analysis with SonarQube...
+    # Quality Gate status: OK
+    # Bugs: 0 | Vulnerabilities: 0 | Code Smells: 3 | Coverage: 91%
+    # [SECURITY] Static analysis passed — Quality Gate: OK
+    # STAGE RESULT: PASSED
+    # -------------------------------------------------------------------
+
+    artifacts:
+      - name: safety-report
+        type: file
+        path: safety-report.json
+      - name: va-report
+        type: file
+        path: va-report.json
+
+# =============================================================================
+# STAGE 4 — ARTIFACT CREATION
+# Promotes the verified image by adding a stable semantic version tag in IBM
+# Container Registry. This tag becomes the authoritative deployment reference.
+# =============================================================================
+  - name: artifact
+    display_name: "Stage 4: Artifact Creation"
+    depends_on: [security]
+    image: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.17"
+    steps:
+
+      - name: tag-release-image
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          source build.env
+          ibmcloud login --apikey "${IBM_API_KEY}" -r "${REGISTRY_REGION}"
+          ibmcloud cr login
+
+          RELEASE_TAG="${ICR_HOST}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
+
+          echo "[ARTIFACT] Tagging verified image as release: ${RELEASE_TAG}"
+          ibmcloud cr image-tag "${FULL_IMAGE_TAG}" "${RELEASE_TAG}"
+
+          echo "RELEASE_TAG=${RELEASE_TAG}" >> build.env
+          echo "[ARTIFACT] Release artifact registered in IBM Container Registry"
+
+      - name: generate-sbom
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          echo "[ARTIFACT] Generating Software Bill of Materials (SBOM)..."
+          pip install --no-cache-dir cyclonedx-bom
+          cyclonedx-py \
+            --format json \
+            --output sbom.json \
+            -r requirements.txt
+          echo "[ARTIFACT] SBOM generated: sbom.json"
+
+    # Simulated output log
+    # -------------------------------------------------------------------
+    # [ARTIFACT] Tagging verified image as release:
+    #   us.icr.io/global-retail-platform/product-microservice:v1.0.0
+    # [ARTIFACT] Release artifact registered in IBM Container Registry
+    # [ARTIFACT] Generating Software Bill of Materials (SBOM)...
+    # [ARTIFACT] SBOM generated: sbom.json — 18 components catalogued
+    # STAGE RESULT: PASSED
+    # -------------------------------------------------------------------
+
+    artifacts:
+      - name: release-image
+        type: image
+        value: "${RELEASE_TAG}"
+      - name: sbom
+        type: file
+        path: sbom.json
+
+# =============================================================================
+# STAGE 5a — DEPLOY TO DEVELOPMENT
+# Automatic deployment to the development cluster on every successful build.
+# No approval required. Intended for developer feedback and smoke testing.
+# =============================================================================
+  - name: deploy-dev
+    display_name: "Stage 5a: Deploy — Development"
+    depends_on: [artifact]
+    approval: none                         # Automatic — no gate
+    image: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.17"
+    steps:
+
+      - name: deploy-to-dev
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          source build.env
+          ibmcloud login --apikey "${IBM_API_KEY}" -r "${REGISTRY_REGION}"
+          ibmcloud ks cluster config --cluster "${IKS_CLUSTER_DEV}"
+
+          echo "[DEPLOY:DEV] Applying Kubernetes manifests to ${NAMESPACE_DEV}..."
+          kubectl set image deployment/product-microservice \
+            product-microservice="${RELEASE_TAG}" \
+            -n "${NAMESPACE_DEV}"
+
+          kubectl rollout status deployment/product-microservice \
+            -n "${NAMESPACE_DEV}" \
+            --timeout=120s
+
+          echo "[DEPLOY:DEV] Deployment complete. Running smoke test..."
+          DEV_ENDPOINT=$(kubectl get svc product-microservice \
+            -n "${NAMESPACE_DEV}" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://${DEV_ENDPOINT}/products")
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "[DEPLOY:DEV] Smoke test FAILED — HTTP ${HTTP_STATUS}"
+            exit 1
+          fi
+          echo "[DEPLOY:DEV] Smoke test passed — HTTP 200 OK"
+
+    # Simulated output log
+    # -------------------------------------------------------------------
+    # [DEPLOY:DEV] Applying Kubernetes manifests to retail-dev...
+    # deployment.apps/product-microservice image updated
+    # Waiting for deployment rollout... Done. 2/2 replicas ready.
+    # [DEPLOY:DEV] Running smoke test...
+    # GET http://product-svc.retail-dev.svc → HTTP 200 OK
+    # [DEPLOY:DEV] Smoke test passed
+    # STAGE RESULT: PASSED
+    # -------------------------------------------------------------------
+
+# =============================================================================
+# STAGE 5b — DEPLOY TO STAGING
+# Requires explicit approval from a designated approver before deployment.
+# Used for integration testing and stakeholder validation.
+# =============================================================================
+  - name: deploy-staging
+    display_name: "Stage 5b: Deploy — Staging"
+    depends_on: [deploy-dev]
+    approval:
+      type: manual
+      approvers:
+        - role: devops-lead
+        - role: qa-lead
+      timeout_hours: 48
+      message: >
+        Development deployment verified. Approve to promote
+        product-microservice:${IMAGE_VERSION} to the Staging environment
+        for integration testing and stakeholder sign-off.
+    image: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.17"
+    steps:
+
+      - name: deploy-to-staging
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          source build.env
+          ibmcloud login --apikey "${IBM_API_KEY}" -r "${REGISTRY_REGION}"
+          ibmcloud ks cluster config --cluster "${IKS_CLUSTER_STG}"
+
+          echo "[DEPLOY:STG] Deploying ${RELEASE_TAG} to ${NAMESPACE_STG}..."
+          kubectl set image deployment/product-microservice \
+            product-microservice="${RELEASE_TAG}" \
+            -n "${NAMESPACE_STG}"
+
+          kubectl rollout status deployment/product-microservice \
+            -n "${NAMESPACE_STG}" \
+            --timeout=180s
+
+          echo "[DEPLOY:STG] Running regression smoke test..."
+          STG_ENDPOINT=$(kubectl get svc product-microservice \
+            -n "${NAMESPACE_STG}" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://${STG_ENDPOINT}/products")
+          [ "${HTTP_STATUS}" = "200" ] \
+            && echo "[DEPLOY:STG] Smoke test passed — HTTP 200 OK" \
+            || { echo "[DEPLOY:STG] Smoke test FAILED"; exit 1; }
+
+    # Simulated output log
+    # -------------------------------------------------------------------
+    # Approval requested — awaiting sign-off from: devops-lead, qa-lead
+    # APPROVED by: devops-lead (2026-03-31T09:14:22Z)
+    # [DEPLOY:STG] Deploying to retail-staging...
+    # deployment.apps/product-microservice image updated
+    # Waiting for rollout... Done. 3/3 replicas ready.
+    # [DEPLOY:STG] Smoke test passed — HTTP 200 OK
+    # STAGE RESULT: PASSED
+    # -------------------------------------------------------------------
+
+# =============================================================================
+# STAGE 5c — DEPLOY TO PRODUCTION
+# Requires senior approval. Uses a rolling update strategy to achieve
+# zero-downtime deployment across the production cluster.
+# =============================================================================
+  - name: deploy-production
+    display_name: "Stage 5c: Deploy — Production"
+    depends_on: [deploy-staging]
+    approval:
+      type: manual
+      approvers:
+        - role: devops-lead
+        - role: security-compliance-director
+        - role: vp-ecommerce
+      timeout_hours: 72
+      message: >
+        Staging validation complete. This deployment will promote
+        product-microservice:${IMAGE_VERSION} to PRODUCTION.
+        Approvals required from: DevOps Lead, Security & Compliance Director,
+        VP E-Commerce. Ensure change window is confirmed before approving.
+    image: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.17"
+    steps:
+
+      - name: deploy-to-production
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          source build.env
+          ibmcloud login --apikey "${IBM_API_KEY}" -r "${REGISTRY_REGION}"
+          ibmcloud ks cluster config --cluster "${IKS_CLUSTER_PROD}"
+
+          echo "[DEPLOY:PROD] Initiating rolling update — zero downtime strategy..."
+          kubectl set image deployment/product-microservice \
+            product-microservice="${RELEASE_TAG}" \
+            -n "${NAMESPACE_PROD}"
+
+          # Rolling update: maxUnavailable=0, maxSurge=1 (defined in deployment manifest)
+          kubectl rollout status deployment/product-microservice \
+            -n "${NAMESPACE_PROD}" \
+            --timeout=300s
+
+          echo "[DEPLOY:PROD] Verifying production health..."
+          PROD_ENDPOINT=$(kubectl get svc product-microservice \
+            -n "${NAMESPACE_PROD}" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://${PROD_ENDPOINT}/products")
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "[DEPLOY:PROD] Health check FAILED — rolling back"
+            kubectl rollout undo deployment/product-microservice -n "${NAMESPACE_PROD}"
+            exit 1
+          fi
+          echo "[DEPLOY:PROD] Production deployment successful — HTTP 200 OK"
+          echo "[DEPLOY:PROD] Active image: ${RELEASE_TAG}"
+
+      - name: notify-stakeholders
+        script: |
+          #!/bin/bash
+          source build.env
+          curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \":white_check_mark: *product-microservice ${IMAGE_VERSION}* deployed to PRODUCTION successfully.\nCommit: \`${GIT_COMMIT_SHORT}\`\nTimestamp: \`${BUILD_TIMESTAMP}\`\"
+            }"
+          echo "[DEPLOY:PROD] Stakeholder notification sent"
+
+    # Simulated output log
+    # -------------------------------------------------------------------
+    # Approval requested — awaiting sign-off from:
+    #   devops-lead, security-compliance-director, vp-ecommerce
+    # APPROVED by: devops-lead             (2026-03-31T11:02:10Z)
+    # APPROVED by: security-compliance-director (2026-03-31T11:08:45Z)
+    # APPROVED by: vp-ecommerce            (2026-03-31T11:15:33Z)
+    # [DEPLOY:PROD] Initiating rolling update — zero downtime strategy...
+    # deployment.apps/product-microservice image updated
+    # Waiting for rollout... Done. 4/4 replicas ready (0 downtime).
+    # [DEPLOY:PROD] Health check — HTTP 200 OK
+    # [DEPLOY:PROD] Production deployment successful
+    # [DEPLOY:PROD] Active image: us.icr.io/global-retail-platform/product-microservice:v1.0.0
+    # [DEPLOY:PROD] Stakeholder notification sent
+    # STAGE RESULT: PASSED
+    # -------------------------------------------------------------------
+
+# =============================================================================
+# Pipeline summary (simulated run)
+# =============================================================================
+# Stage 1  Build               PASSED   00:02:14
+# Stage 2  Test                PASSED   00:01:07  (9 tests, coverage 91%)
+# Stage 3  Security            PASSED   00:03:45  (0 critical vulns)
+# Stage 4  Artifact Creation   PASSED   00:00:38
+# Stage 5a Deploy Dev          PASSED   00:01:22  (smoke test OK)
+# Stage 5b Deploy Staging      PASSED   00:02:10  (manual approval: devops-lead)
+# Stage 5c Deploy Production   PASSED   00:03:01  (3 approvals, rolling update)
+# -----------------------------------------------------------------------------
+# Total pipeline duration: 00:14:17   |   Result: SUCCESS
+# =============================================================================
